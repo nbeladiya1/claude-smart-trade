@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, date
 from enum import Enum
 
-import MetaTrader5 as mt5
+# Use MT5 wrapper for cross-platform compatibility
+import mt5_wrapper as mt5
 
 import config
 

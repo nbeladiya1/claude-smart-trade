@@ -17,7 +17,8 @@ import os
 from datetime import datetime, date
 from typing import Optional
 
-import MetaTrader5 as mt5
+# Use MT5 wrapper for cross-platform compatibility
+import mt5_wrapper as mt5
 import pandas as pd
 import numpy as np
 
