@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Smart Trade Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/smart-trade
+Environment=DISPLAY=:0
+ExecStart=/opt/smart-trade/venv/bin/python /opt/smart-trade/smart_trade.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/smart-trade/bot.log
+StandardError=append:/var/log/smart-trade/error.log
+
+[Install]
+WantedBy=multi-user.target
