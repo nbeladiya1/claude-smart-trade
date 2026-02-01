@@ -1,6 +1,11 @@
 #!/bin/bash
-# One-click VPS Setup Script for Claude Smart Trade Bot
+# One-click VPS Setup Script for Claude Smart Trade Bot v2.0
 # Run this on your Hostinger VPS terminal
+#
+# Features:
+# - Dual-LLM Trading System (FinGPT + FinLLaMA)
+# - Advanced Money Management
+# - Telegram Notifications
 
 set -e
 
@@ -9,7 +14,8 @@ LOG_DIR="/var/log/smart-trade"
 REPO_URL="https://github.com/naushik007/claude-smart-trade.git"
 
 echo "=========================================="
-echo "Claude Smart Trade Bot - VPS Setup"
+echo "Claude Smart Trade Bot v2.0 - VPS Setup"
+echo "Dual-LLM Trading System"
 echo "=========================================="
 
 # Update system
@@ -74,8 +80,13 @@ echo "=========================================="
 echo ""
 echo "NEXT STEPS:"
 echo ""
-echo "1. Edit your MT5 credentials:"
+echo "1. Configure your credentials:"
 echo "   nano /opt/smart-trade/.env"
+echo ""
+echo "   Required settings:"
+echo "   - MT5_LOGIN, MT5_PASSWORD, MT5_SERVER"
+echo "   - OPENAI_API_KEY or ANTHROPIC_API_KEY"
+echo "   - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID"
 echo ""
 echo "2. Start the trading bot:"
 echo "   systemctl start smart-trade"
@@ -85,6 +96,11 @@ echo "   systemctl status smart-trade"
 echo ""
 echo "4. View logs:"
 echo "   tail -f /var/log/smart-trade/bot.log"
+echo ""
+echo "Features enabled:"
+echo "- Dual-LLM System (FinGPT + FinLLaMA)"
+echo "- Advanced Money Management"
+echo "- Telegram Notifications"
 echo ""
 echo "The bot will automatically start on system reboot."
 echo "=========================================="

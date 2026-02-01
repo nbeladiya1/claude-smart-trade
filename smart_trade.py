@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """
-Claude Smart Trade Bot
-A MetaTrader 5 trading bot for automated trading.
+Claude Smart Trade Bot v2.0
+A MetaTrader 5 trading bot with Dual-LLM Decision System.
+
+Features:
+- Dual-LLM agents (FinGPT + FinLLaMA) for trading decisions
+- Advanced money management with risk controls
+- Telegram notifications for all updates
+- Automated position management with trailing stops
 """
 import logging
 import time
 import sys
 import signal
-from datetime import datetime
+import os
+from datetime import datetime, date
+from typing import Optional
 
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 
 import config
+from llm_agents import DualAgentConsensus, get_financial_news, Signal
+from money_management import MoneyManager, RiskMetrics
+from telegram_bot import get_notifier, TelegramNotifier
+
+# Ensure log directory exists
+os.makedirs('/var/log/smart-trade', exist_ok=True)
 
 # Configure logging
 logging.basicConfig(
@@ -38,18 +52,34 @@ TIMEFRAMES = {
     'W1': mt5.TIMEFRAME_W1,
 }
 
+
 class SmartTradeBot:
-    """Main trading bot class."""
+    """
+    Main trading bot class with Dual-LLM decision system.
+    Integrates FinGPT (sentiment) and FinLLaMA (technical) agents.
+    """
 
     def __init__(self):
         self.running = True
         self.connected = False
+
+        # Initialize components
+        self.telegram = get_notifier()
+        self.money_manager = MoneyManager()
+        self.dual_agent = DualAgentConsensus() if config.USE_DUAL_LLM else None
+
+        # Track daily stats
+        self.trades_today = 0
+        self.last_summary_date: Optional[date] = None
+
+        # Signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
         logger.info(f"Received signal {signum}. Shutting down...")
+        self.telegram.notify_bot_stopped(f"Signal {signum} received")
         self.running = False
 
     def connect(self) -> bool:
@@ -57,7 +87,9 @@ class SmartTradeBot:
         logger.info("Initializing MetaTrader 5...")
 
         if not mt5.initialize():
-            logger.error(f"MT5 initialization failed: {mt5.last_error()}")
+            error = mt5.last_error()
+            logger.error(f"MT5 initialization failed: {error}")
+            self.telegram.notify_error(f"MT5 initialization failed: {error}")
             return False
 
         # Login to account if credentials provided
@@ -69,7 +101,9 @@ class SmartTradeBot:
                 server=config.MT5_SERVER
             )
             if not authorized:
-                logger.error(f"Login failed: {mt5.last_error()}")
+                error = mt5.last_error()
+                logger.error(f"Login failed: {error}")
+                self.telegram.notify_error(f"MT5 login failed: {error}")
                 mt5.shutdown()
                 return False
 
@@ -78,6 +112,9 @@ class SmartTradeBot:
             logger.info(f"Connected to account: {account_info.login}")
             logger.info(f"Balance: {account_info.balance} {account_info.currency}")
             logger.info(f"Server: {account_info.server}")
+
+        # Initialize money manager
+        self.money_manager.initialize()
 
         self.connected = True
         return True
@@ -102,48 +139,74 @@ class SmartTradeBot:
         df['time'] = pd.to_datetime(df['time'], unit='s')
         return df
 
-    def calculate_sma(self, data: pd.DataFrame, period: int) -> pd.Series:
-        """Calculate Simple Moving Average."""
-        return data['close'].rolling(window=period).mean()
+    def calculate_atr(self, data: pd.DataFrame, period: int = 14) -> float:
+        """Calculate Average True Range."""
+        high = data['high']
+        low = data['low']
+        close = data['close']
 
-    def calculate_rsi(self, data: pd.DataFrame, period: int = 14) -> pd.Series:
-        """Calculate Relative Strength Index."""
-        delta = data['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+        tr = pd.concat([
+            high - low,
+            abs(high - close.shift()),
+            abs(low - close.shift())
+        ], axis=1).max(axis=1)
 
-    def generate_signal(self, data: pd.DataFrame) -> str:
-        """Generate trading signal based on indicators."""
+        atr = tr.rolling(window=period).mean()
+        return atr.iloc[-1] if not atr.empty else 0
+
+    def get_fallback_signal(self, data: pd.DataFrame) -> str:
+        """Generate fallback signal when LLM is not available."""
         if len(data) < 50:
             return 'HOLD'
 
-        # Calculate indicators
-        data['sma_fast'] = self.calculate_sma(data, 10)
-        data['sma_slow'] = self.calculate_sma(data, 50)
-        data['rsi'] = self.calculate_rsi(data)
+        close = data['close']
+        sma_fast = close.rolling(window=10).mean()
+        sma_slow = close.rolling(window=50).mean()
 
-        last = data.iloc[-1]
-        prev = data.iloc[-2]
+        # RSI
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
 
-        # Simple crossover strategy with RSI filter
-        if (prev['sma_fast'] <= prev['sma_slow'] and
-            last['sma_fast'] > last['sma_slow'] and
-            last['rsi'] < 70):
+        last_sma_fast = sma_fast.iloc[-1]
+        last_sma_slow = sma_slow.iloc[-1]
+        prev_sma_fast = sma_fast.iloc[-2]
+        prev_sma_slow = sma_slow.iloc[-2]
+        last_rsi = rsi.iloc[-1]
+
+        # Crossover strategy with RSI filter
+        if (prev_sma_fast <= prev_sma_slow and
+            last_sma_fast > last_sma_slow and
+            last_rsi < 70):
             return 'BUY'
 
-        if (prev['sma_fast'] >= prev['sma_slow'] and
-            last['sma_fast'] < last['sma_slow'] and
-            last['rsi'] > 30):
+        if (prev_sma_fast >= prev_sma_slow and
+            last_sma_fast < last_sma_slow and
+            last_rsi > 30):
             return 'SELL'
 
         return 'HOLD'
 
-    def execute_trade(self, symbol: str, signal: str) -> bool:
-        """Execute a trade based on the signal."""
-        if signal == 'HOLD':
+    def execute_trade(
+        self,
+        symbol: str,
+        signal_type: str,
+        confidence: float = 1.0
+    ) -> bool:
+        """Execute a trade with money management."""
+        if signal_type == 'HOLD':
             return True
+
+        is_buy = signal_type in ['BUY', 'STRONG_BUY']
+
+        # Check if trading is allowed
+        can_trade, reason = self.money_manager.can_trade()
+        if not can_trade:
+            logger.warning(f"Trading not allowed: {reason}")
+            self.telegram.notify_risk_alert("Trading Blocked", reason)
+            return False
 
         symbol_info = mt5.symbol_info(symbol)
         if symbol_info is None:
@@ -155,23 +218,48 @@ class SmartTradeBot:
                 logger.error(f"Failed to select {symbol}")
                 return False
 
-        point = symbol_info.point
-        price = mt5.symbol_info_tick(symbol).ask if signal == 'BUY' else mt5.symbol_info_tick(symbol).bid
+        # Get current price
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            logger.error("Failed to get tick data")
+            return False
 
-        sl = price - config.STOP_LOSS * point if signal == 'BUY' else price + config.STOP_LOSS * point
-        tp = price + config.TAKE_PROFIT * point if signal == 'BUY' else price - config.TAKE_PROFIT * point
+        price = tick.ask if is_buy else tick.bid
+
+        # Calculate ATR for dynamic SL/TP
+        data = self.get_market_data(symbol, config.TIMEFRAME, 50)
+        atr = self.calculate_atr(data) if not data.empty else None
+
+        # Calculate stop loss and take profit
+        sl_price, sl_pips = self.money_manager.calculate_stop_loss(
+            symbol, price, is_buy, atr
+        )
+        tp_price, tp_pips = self.money_manager.calculate_take_profit(
+            symbol, price, is_buy, sl_pips
+        )
+
+        # Calculate position size
+        position = self.money_manager.calculate_position_size(
+            symbol, sl_pips, tp_pips, confidence
+        )
+        if not position:
+            logger.error("Failed to calculate position size")
+            return False
+
+        # Execute the trade
+        order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
-            "volume": config.LOT_SIZE,
-            "type": mt5.ORDER_TYPE_BUY if signal == 'BUY' else mt5.ORDER_TYPE_SELL,
+            "volume": position.lots,
+            "type": order_type,
             "price": price,
-            "sl": sl,
-            "tp": tp,
+            "sl": sl_price,
+            "tp": tp_price,
             "deviation": 20,
             "magic": 123456,
-            "comment": "Smart Trade Bot",
+            "comment": f"SmartTrade-{signal_type}",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
@@ -179,10 +267,26 @@ class SmartTradeBot:
         result = mt5.order_send(request)
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error(f"Order failed: {result.retcode} - {result.comment}")
+            error_msg = f"Order failed: {result.retcode} - {result.comment}"
+            logger.error(error_msg)
+            self.telegram.notify_error(error_msg)
             return False
 
-        logger.info(f"Order executed: {signal} {config.LOT_SIZE} {symbol} at {price}")
+        logger.info(f"Order executed: {signal_type} {position.lots} {symbol} at {price}")
+
+        # Send Telegram notification
+        self.telegram.notify_trade_opened(
+            order_type="BUY" if is_buy else "SELL",
+            symbol=symbol,
+            lots=position.lots,
+            price=price,
+            sl=sl_price,
+            tp=tp_price,
+            risk_amount=position.risk_amount,
+            risk_percent=position.risk_percent
+        )
+
+        self.trades_today += 1
         return True
 
     def check_open_positions(self) -> int:
@@ -190,20 +294,64 @@ class SmartTradeBot:
         positions = mt5.positions_get(symbol=config.SYMBOL)
         return len(positions) if positions else 0
 
+    def manage_open_positions(self):
+        """Manage existing positions (trailing stops, etc.)."""
+        positions = mt5.positions_get(symbol=config.SYMBOL)
+        if not positions:
+            return
+
+        for pos in positions:
+            # Update trailing stop
+            if config.USE_TRAILING_STOP:
+                self.money_manager.update_trailing_stop(pos)
+
+    def send_daily_summary(self):
+        """Send daily trading summary if not sent today."""
+        today = date.today()
+        if self.last_summary_date == today:
+            return
+
+        # Only send at specific hour (e.g., 18:00)
+        if datetime.now().hour != 18:
+            return
+
+        metrics = self.money_manager.get_risk_metrics()
+        if not metrics:
+            return
+
+        stats = self.money_manager.get_statistics()
+
+        self.telegram.notify_daily_summary(
+            balance=metrics.account_balance,
+            equity=metrics.account_equity,
+            daily_pnl=metrics.daily_pnl,
+            daily_pnl_percent=metrics.daily_pnl_percent,
+            trades_today=self.trades_today,
+            win_rate=stats.get('win_rate', 0)
+        )
+
+        self.last_summary_date = today
+        self.trades_today = 0  # Reset for next day
+
     def run(self):
-        """Main bot loop."""
-        logger.info("=" * 50)
-        logger.info("Claude Smart Trade Bot Starting")
-        logger.info("=" * 50)
+        """Main bot loop with Dual-LLM decision system."""
+        logger.info("=" * 60)
+        logger.info("  Claude Smart Trade Bot v2.0 - Dual-LLM System")
+        logger.info("=" * 60)
 
         if not self.connect():
             logger.error("Failed to connect to MT5. Exiting.")
             return
 
         logger.info(f"Trading {config.SYMBOL} on {config.TIMEFRAME}")
-        logger.info(f"Lot size: {config.LOT_SIZE}, SL: {config.STOP_LOSS}, TP: {config.TAKE_PROFIT}")
-        logger.info(f"Check interval: {config.CHECK_INTERVAL} seconds")
-        logger.info("=" * 50)
+        logger.info(f"Risk per trade: {config.RISK_PER_TRADE}%")
+        logger.info(f"Max daily loss: {config.MAX_DAILY_LOSS}%")
+        logger.info(f"Dual-LLM: {'Enabled' if config.USE_DUAL_LLM else 'Disabled'}")
+        logger.info(f"Telegram: {'Enabled' if config.TELEGRAM_ENABLED else 'Disabled'}")
+        logger.info("=" * 60)
+
+        # Notify bot started
+        self.telegram.notify_bot_started()
 
         while self.running:
             try:
@@ -215,34 +363,85 @@ class SmartTradeBot:
                     time.sleep(config.CHECK_INTERVAL)
                     continue
 
-                # Generate signal
-                signal = self.generate_signal(data)
                 current_price = data.iloc[-1]['close']
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-                logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                           f"{config.SYMBOL}: {current_price:.5f} | Signal: {signal}")
+                # Get trading signal
+                if config.USE_DUAL_LLM and self.dual_agent:
+                    # Dual-LLM Decision System
+                    logger.info("Consulting LLM agents...")
+                    news = get_financial_news(config.SYMBOL)
+                    consensus = self.dual_agent.get_consensus(data, news)
+
+                    signal_str = consensus.final_signal.value
+                    confidence = consensus.confidence
+                    trade_recommended = consensus.trade_recommended
+
+                    # Notify about signal
+                    self.telegram.notify_signal(
+                        signal=signal_str,
+                        confidence=confidence,
+                        agent1_signal=consensus.agent1_analysis.signal.value,
+                        agent2_signal=consensus.agent2_analysis.signal.value,
+                        reasoning=consensus.consensus_reasoning
+                    )
+
+                    # Notify about LLM conversation
+                    self.telegram.notify_llm_conversation(
+                        agent1_name=consensus.agent1_analysis.agent_name,
+                        agent1_analysis=consensus.agent1_analysis.reasoning,
+                        agent2_name=consensus.agent2_analysis.agent_name,
+                        agent2_analysis=consensus.agent2_analysis.reasoning,
+                        consensus=f"Final: {signal_str} ({confidence:.1%})"
+                    )
+                else:
+                    # Fallback to simple strategy
+                    signal_str = self.get_fallback_signal(data)
+                    confidence = 0.7
+                    trade_recommended = signal_str != 'HOLD'
+
+                logger.info(f"[{timestamp}] {config.SYMBOL}: {current_price:.5f} | "
+                           f"Signal: {signal_str} | Confidence: {confidence:.1%}")
 
                 # Check open positions
                 open_positions = self.check_open_positions()
 
-                # Execute trade if signal and no open position
-                if signal != 'HOLD' and open_positions == 0:
-                    self.execute_trade(config.SYMBOL, signal)
+                # Manage existing positions
+                self.manage_open_positions()
+
+                # Execute trade if recommended and no open position
+                if trade_recommended and open_positions == 0:
+                    self.execute_trade(config.SYMBOL, signal_str, confidence)
                 elif open_positions > 0:
                     logger.info(f"Already have {open_positions} open position(s)")
+
+                # Check for daily summary
+                self.send_daily_summary()
 
                 time.sleep(config.CHECK_INTERVAL)
 
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
+                self.telegram.notify_error(f"Main loop error: {e}")
                 time.sleep(config.CHECK_INTERVAL)
 
         self.disconnect()
+        self.telegram.notify_bot_stopped("Normal shutdown")
         logger.info("Bot stopped")
 
 
 def main():
     """Entry point."""
+    print("""
+    ╔═══════════════════════════════════════════════════════════╗
+    ║                                                           ║
+    ║   Claude Smart Trade Bot v2.0                             ║
+    ║   Dual-LLM Trading Decision System                        ║
+    ║                                                           ║
+    ║   FinGPT (Sentiment) + FinLLaMA (Technical)               ║
+    ║                                                           ║
+    ╚═══════════════════════════════════════════════════════════╝
+    """)
     bot = SmartTradeBot()
     bot.run()
 
