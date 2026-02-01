@@ -1,5 +1,5 @@
 [Unit]
-Description=Claude Smart Trade Bot
+Description=Claude Smart Trade Bot v3.0
 After=network.target
 Wants=network-online.target
 
@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/opt/smart-trade
-Environment=DISPLAY=:0
-ExecStart=/opt/smart-trade/venv/bin/python /opt/smart-trade/smart_trade.py
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/smart-trade/venv/bin/python /opt/smart-trade/smart_trade_v3.py
 Restart=always
 RestartSec=10
 StandardOutput=append:/var/log/smart-trade/bot.log
